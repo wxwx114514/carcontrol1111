@@ -1,0 +1,44 @@
+name: build-apk
+
+# 云端编译 APK：本机什么都不用装（不用 Android Studio / SDK / JDK）
+# 触发：push 代码，或在 Actions 页面点 "Run workflow"
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 准备 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 平台与构建工具
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: 安装 Gradle 8.5
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: 编译 debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: carcontrol-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
