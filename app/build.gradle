@@ -1,0 +1,38 @@
+// 只依赖安卓 SDK 本身，不需要任何第三方库，也不需要 AndroidX
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.carcontrol'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.carcontrol"
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+// 注意：这里刻意没有 dependencies { }，所以 Gradle 不需要联网拉任何库
