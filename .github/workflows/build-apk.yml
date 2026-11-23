@@ -1,7 +1,5 @@
 name: build-apk
 
-# 云端编译 APK：本机什么都不用装（不用 Android Studio / SDK / JDK）
-# 触发：push 代码，或在 Actions 页面点 "Run workflow"
 on:
   push:
     branches: [ main, master ]
@@ -20,13 +18,16 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: 准备 Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: 安装 SDK 平台与构建工具
+      - name: 补装 Android SDK 平台
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          set -e
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1)
+          if [ -z "$SDKM" ]; then SDKM=$(command -v sdkmanager || true); fi
+          echo "sdkmanager = $SDKM"
+          test -n "$SDKM"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: 安装 Gradle 8.5
         uses: gradle/actions/setup-gradle@v3
