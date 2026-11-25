@@ -6,6 +6,7 @@ import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.content.DialogInterface;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.os.Build;
@@ -18,6 +19,7 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -26,18 +28,27 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 主界面（全程序化创建 UI，不需要 XML 布局，也不需要第三方库）
+ * 主界面（全程序化创建 UI，无第三方库）
  *
- *   ┌──────────────────────────────────────────────┐
- *   │ 状态文字          [连接] [急停] [回正]        │
- *   ├───────────────────────┬──────────────────────┤
- *   │      方向盘            │      前后滑块         │
- *   │  （不自动回正 + 0° 吸附）│ （保持位置 + 刻度）    │
- *   └───────────────────────┴──────────────────────┘
+ *   ┌────────────────────────────────────────────────┐
+ *   │ 状态          [连接] [急停] [回正] [调参]        │
+ *   ├───────────────────────┬────────────────────────┤
+ *   │      方向盘            │       前后滑块          │
+ *   └───────────────────────┴────────────────────────┘
+ *
+ * 调参（保存到 SharedPreferences，下次连上自动下发）：
+ *   · 死区下限：20%~90%（低于它电机推不动的占空比）
+ *   · 直行微调：-300~+300‰（抵消两轮转速差）
+ *
+ * 急停：点一次即锁定，再点无效；解除只能断开重连（或重启 App）。
  */
 public class MainActivity extends Activity implements BtSppClient.Listener {
 
     private static final int REQ_BT_PERM = 1001;
+
+    private static final String PREFS = "car_cfg";
+    private static final String K_DUTY = "duty_min";
+    private static final String K_TRIM = "trim";
 
     private final BtSppClient bt = new BtSppClient();
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -47,12 +58,16 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
     private TextView status;
     private Button btnConnect;
     private Button btnEstop;
+    private Button btnCfg;
 
-    private boolean estop = false;
+    private boolean estopLatched = false;
     private boolean txRunning = false;
     private boolean pendingConnect = false;
 
-    /** 33ms 一次，往发送线程塞最新值 */
+    private int dutyMin = 40;        /* 死区下限 % */
+    private int trim = 0;            /* 直行微调 ‰ */
+
+    /** 33ms 一次，把最新状态交给发送线程 */
     private final Runnable txTask = new Runnable() {
         @Override
         public void run() {
@@ -60,10 +75,12 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
                 txRunning = false;
                 return;
             }
-            int v = estop ? 0 : slider.getValue();
-            int w = estop ? 0 : wheel.getW();
-            int flags = estop ? CarProtocol.FLAG_ESTOP : 0;
-            bt.send(v, w, flags);
+            int v = estopLatched ? 0 : slider.getValue();
+            int w = estopLatched ? 0 : wheel.getW();
+            int flags = estopLatched
+                    ? (CarProtocol.FLAG_ESTOP | CarProtocol.FLAG_BRAKE)
+                    : 0;
+            bt.offerMotion(CarProtocol.frame(v, w, flags));
             updateStatus();
             ui.postDelayed(this, 33);
         }
@@ -75,10 +92,12 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        loadConfig();
         setContentView(buildUi());
-
         requestBtPermissionIfNeeded();
     }
+
+    // ===================== 界面 =====================
 
     private View buildUi() {
         LinearLayout root = new LinearLayout(this);
@@ -86,7 +105,6 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
         root.setBackgroundColor(0xFF102027);
         root.setPadding(dp(8), dp(6), dp(8), dp(6));
 
-        // ---------- 顶栏 ----------
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
@@ -111,13 +129,7 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
         btnEstop.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                estop = !estop;
-                btnEstop.setText(estop ? "解除急停" : "急停");
-                if (estop) {
-                    slider.setValue(0);
-                    wheel.recenter();
-                }
-                updateStatus();
+                onEstopClicked();
             }
         });
         bar.addView(btnEstop);
@@ -132,11 +144,19 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
         });
         bar.addView(btnCenter);
 
+        btnCfg = makeButton("调参", 0xFF00695C);
+        btnCfg.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showConfigDialog();
+            }
+        });
+        bar.addView(btnCfg);
+
         root.addView(bar, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // ---------- 主体：方向盘 + 滑块 ----------
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.HORIZONTAL);
         body.setPadding(0, dp(6), 0, 0);
@@ -161,9 +181,10 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
         b.setTextSize(13f);
         b.setTextColor(Color.WHITE);
         b.setBackgroundColor(color);
-        b.setPadding(dp(14), dp(4), dp(14), dp(4));
+        b.setPadding(dp(12), dp(4), dp(12), dp(4));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.setMargins(dp(6), 0, 0, 0);
         b.setLayoutParams(lp);
         return b;
@@ -171,6 +192,125 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
 
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    // ===================== 调参 =====================
+
+    private void loadConfig() {
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        dutyMin = sp.getInt(K_DUTY, 40);
+        trim = sp.getInt(K_TRIM, 0);
+        /* 防脏数据：超出范围就夹回来，避免 SeekBar 进度为负 */
+        if (dutyMin < 20) dutyMin = 20;
+        if (dutyMin > 90) dutyMin = 90;
+        if (trim < -300) trim = -300;
+        if (trim > 300) trim = 300;
+    }
+
+    private void saveConfig() {
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        sp.edit().putInt(K_DUTY, dutyMin).putInt(K_TRIM, trim).apply();
+    }
+
+    /** 把当前参数发给单片机（0x02 参数帧） */
+    private void sendConfig() {
+        bt.offerConfig(CarProtocol.config(dutyMin, trim));
+    }
+
+    private void showConfigDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24), dp(14), dp(24), dp(6));
+
+        final TextView tvDuty = new TextView(this);
+        tvDuty.setTextColor(Color.WHITE);
+        tvDuty.setTextSize(15f);
+        final TextView tvTrim = new TextView(this);
+        tvTrim.setTextColor(Color.WHITE);
+        tvTrim.setTextSize(15f);
+
+        final SeekBar sbDuty = new SeekBar(this);
+        sbDuty.setMax(14);                              /* 20 + 5*14 = 90 */
+        sbDuty.setProgress((dutyMin - 20) / 5);
+
+        final SeekBar sbTrim = new SeekBar(this);
+        sbTrim.setMax(60);                              /* -300 + 10*60 = 300 */
+        sbTrim.setProgress((trim + 300) / 10);
+
+        final int[] picked = new int[]{dutyMin, trim};
+
+        tvDuty.setText("死区下限（起转占空比）：" + picked[0] + " %");
+        tvTrim.setText("直行微调： " + picked[1] + " ‰");
+
+        sbDuty.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
+                picked[0] = 20 + p * 5;
+                tvDuty.setText("死区下限（起转占空比）：" + picked[0] + " %");
+            }
+            @Override public void onStartTrackingTouch(SeekBar sb) { }
+            @Override public void onStopTrackingTouch(SeekBar sb) { }
+        });
+
+        sbTrim.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
+                picked[1] = -300 + p * 10;
+                tvTrim.setText("直行微调： " + picked[1] + " ‰");
+            }
+            @Override public void onStartTrackingTouch(SeekBar sb) { }
+            @Override public void onStopTrackingTouch(SeekBar sb) { }
+        });
+
+        box.addView(tvDuty);
+        box.addView(sbDuty);
+        box.addView(tvTrim);
+        box.addView(sbTrim);
+
+        TextView tip = new TextView(this);
+        tip.setTextColor(0xFFB0BEC5);
+        tip.setTextSize(12f);
+        tip.setText("死区越小越灵敏，但太小会推不动；\n"
+                + "车往左偏就把微调往右拉，往右偏就往左拉。");
+        box.addView(tip);
+
+        new AlertDialog.Builder(this)
+                .setTitle("调参（保存后下次自动下发）")
+                .setView(box)
+                .setPositiveButton("保存并下发", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        dutyMin = picked[0];
+                        trim = picked[1];
+                        saveConfig();
+                        if (bt.isConnected()) sendConfig();
+                        toast("已保存：" + dutyMin + "% / " + trim + "‰");
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    // ===================== 急停（自锁） =====================
+
+    private void onEstopClicked() {
+        if (estopLatched) {
+            toast("急停已锁定，需断开重连才能解除");
+            return;
+        }
+        estopLatched = true;
+        btnEstop.setEnabled(false);
+        btnEstop.setText("已锁定");
+        slider.setValue(0);
+        wheel.recenter();
+        updateStatus();
+        toast("急停已锁定");
+    }
+
+    private void clearEstop() {
+        estopLatched = false;
+        btnEstop.setEnabled(true);
+        btnEstop.setText("急停");
     }
 
     // ===================== 蓝牙 =====================
@@ -211,9 +351,9 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
         if (bt.isConnected()) {
             bt.stop();
             stopTxLoop();
-            estop = false;
-            btnEstop.setText("急停");
+            clearEstop();
             status.setText("已断开");
+            btnConnect.setText("连接");
             return;
         }
         if (!hasBtPermission()) {
@@ -252,19 +392,20 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
         }
 
         if (devices.isEmpty()) {
-            toast("还没有配对设备：请先在系统设置里配对 HC-05（PIN 1234 或 0000）");
+            toast("还没有配对设备：请先在系统设置里配对 HC-05（PIN 1234）");
             return;
         }
 
         new AlertDialog.Builder(this)
                 .setTitle("选择已配对的 HC-05")
-                .setItems(names.toArray(new String[0]), new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        status.setText("正在连接…");
-                        bt.connectAsync(devices.get(which), MainActivity.this);
-                    }
-                })
+                .setItems(names.toArray(new String[0]),
+                        new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialog, int which) {
+                                status.setText("正在连接…");
+                                bt.connectAsync(devices.get(which), MainActivity.this);
+                            }
+                        })
                 .setNegativeButton("取消", null)
                 .show();
     }
@@ -276,15 +417,15 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
             public void run() {
                 status.setText(message);
                 if (connected) {
-                    estop = false;
-                    btnEstop.setText("急停");
+                    clearEstop();               /* 新的一次连接 = 解除急停 */
                     btnConnect.setText("断开");
+                    btnCfg.setEnabled(true);
                     startTxLoop();
+                    sendConfig();               /* 连上先下发保存好的参数 */
                 } else {
                     btnConnect.setText("连接");
                     stopTxLoop();
-                    // 兜底：连不上/断线时确保车是停的
-                    bt.send(0, 0, CarProtocol.FLAG_BRAKE);
+                    clearEstop();
                 }
             }
         });
@@ -306,10 +447,9 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
     @Override
     protected void onPause() {
         super.onPause();
-        // 退到后台立刻停车：先塞一帧"零速+刹车"，再停止推送；
-        // 真出问题还有单片机那边的 300ms 掉线保护兜底
         if (bt.isConnected()) {
-            bt.send(0, 0, CarProtocol.FLAG_BRAKE);
+            bt.offerMotion(CarProtocol.frame(0, 0,
+                    CarProtocol.FLAG_BRAKE | CarProtocol.FLAG_ESTOP));
         }
         stopTxLoop();
     }
@@ -329,9 +469,10 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
 
     private void updateStatus() {
         if (!bt.isConnected()) return;
-        String s = "已连接  V=" + (estop ? 0 : slider.getValue())
-                + "  W=" + (estop ? 0 : wheel.getW())
-                + (estop ? "  [急停]" : "");
+        String s = "已连接  V=" + (estopLatched ? 0 : slider.getValue())
+                + "  W=" + (estopLatched ? 0 : wheel.getW())
+                + "  [死区 " + dutyMin + "% 微调 " + trim + "‰]"
+                + (estopLatched ? "  急停锁定" : "");
         status.setText(s);
     }
 

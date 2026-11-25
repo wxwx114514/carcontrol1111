@@ -10,15 +10,13 @@ import java.util.UUID;
 /**
  * HC-05 经典蓝牙 SPP 客户端。
  *
- * 设计要点：
- *   1. connect() 会阻塞，必须在后台线程调用；
- *   2. 发送用独立线程，30Hz，永远只发"最新的"一组值（丢旧帧，不排队），
- *      这样即使某次发送变慢，操作也不会越积越延迟；
- *   3. 断线/异常统一走 stop()，主界面负责在断开时补发停车帧。
+ * 发送策略：
+ *   · 控制帧：永远只保留"最新一帧"，旧的直接丢（不排队，避免延迟累积）
+ *   · 参数帧：优先发送，插在控制帧前面，保证调参一定能挤进去
+ *   · 独立线程 30ms 一轮，绝不阻塞 UI
  */
 public class BtSppClient {
 
-    /** 经典蓝牙串口（SPP）标准 UUID，HC-05/06 都用这个 */
     private static final UUID SPP_UUID =
             UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
@@ -30,10 +28,11 @@ public class BtSppClient {
     private volatile OutputStream out;
     private volatile boolean running;
 
-    private volatile int pendingV;
-    private volatile int pendingW;
-    private volatile int pendingFlags;
-    private volatile boolean dirty;
+    private volatile byte[] pendingMotion;
+    private volatile boolean motionDirty;
+
+    private volatile byte[] pendingConfig;
+    private volatile boolean configDirty;
 
     private Thread txThread;
 
@@ -64,12 +63,16 @@ public class BtSppClient {
         }, "bt-connect").start();
     }
 
-    /** 只记录"最新要发的东西"，真正发送在发送线程里做 */
-    public void send(int v, int w, int flags) {
-        pendingV = v;
-        pendingW = w;
-        pendingFlags = flags;
-        dirty = true;
+    /** 控制帧：只保留最新一帧 */
+    public void offerMotion(byte[] frame) {
+        pendingMotion = frame;
+        motionDirty = true;
+    }
+
+    /** 参数帧：优先发一次 */
+    public void offerConfig(byte[] frame) {
+        pendingConfig = frame;
+        configDirty = true;
     }
 
     private void startTxLoop() {
@@ -78,9 +81,15 @@ public class BtSppClient {
             public void run() {
                 while (running) {
                     try {
-                        if (dirty) {
-                            dirty = false;
-                            byte[] f = CarProtocol.frame(pendingV, pendingW, pendingFlags);
+                        byte[] f = null;
+                        if (configDirty) {
+                            f = pendingConfig;
+                            configDirty = false;
+                        } else if (motionDirty) {
+                            f = pendingMotion;
+                            motionDirty = false;
+                        }
+                        if (f != null) {
                             OutputStream o = out;
                             if (o != null) {
                                 o.write(f);
@@ -102,7 +111,8 @@ public class BtSppClient {
 
     public void stop() {
         running = false;
-        dirty = false;
+        motionDirty = false;
+        configDirty = false;
 
         Thread t = txThread;
         txThread = null;

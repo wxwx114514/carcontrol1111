@@ -10,32 +10,56 @@ import android.view.MotionEvent;
 import android.view.View;
 
 /**
- * 方向盘控件：
+ * 方向盘控件（加强版 0° 吸附）：
  *   · 拖动手感：绕圆心转，转到哪儿停在哪儿（不自动回正）
- *   · 0° 吸附：|角度| < 8° 直接归零，配一次轻微振动和"软吸附区"（±18° 内减敏）
+ *   · 0° 吸附：|角度| < 12° 直接归零；±30° 范围内灵敏度降到 0.18（越靠近 0 越"粘"）
+ *   · 松手时若在 ±22° 内，会自动"吸"回 0° 并给一次强振动
  *   · 输出：getW() 返回 -1000~+1000（正 = 右转），带 3° 输出死区
  */
 public class SteeringWheelView extends View {
 
     /** 满舵角度（左右各 135°） */
     private static final float MAX_ANGLE = 135f;
-    /** 吸附区：进入这个范围直接归 0 */
-    private static final float SNAP_ZONE = 8f;
-    /** 软吸附区：这个范围里拖动灵敏度降低，模拟"卡位"手感 */
-    private static final float SOFT_ZONE = 18f;
-    /** 输出死区：|角度| 小于这个值输出 0，避免走直线时左右乱修 */
+    /** 硬吸附区：进入就归 0 */
+    private static final float SNAP_ZONE = 12f;
+    /** 软吸附区：范围内拖动灵敏度大幅降低，形成"卡位"感 */
+    private static final float SOFT_ZONE = 30f;
+    /** 软吸附区内的灵敏度系数（0.18 = 只有正常的 18%） */
+    private static final float SOFT_SENS = 0.18f;
+    /** 松手后自动吸回 0° 的范围 */
+    private static final float RELEASE_SNAP = 22f;
+    /** 输出死区 */
     private static final float DEAD_ZONE = 3f;
 
-    private float angle = 0f;            // 当前角度（度，右为正）
+    private float angle = 0f;
     private float lastTouchAngle = 0f;
     private boolean dragging = false;
     private boolean inSnap = true;
+    private boolean animating = false;
 
     private final Paint paintRing = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint paintTick = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint paintZone = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint paintKnob = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint paintText = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF arcRect = new RectF();
+
+    /** 松手后的回吸动画 */
+    private final Runnable snapAnim = new Runnable() {
+        @Override
+        public void run() {
+            if (Math.abs(angle) < 0.4f) {
+                angle = 0f;
+                inSnap = true;
+                animating = false;
+                invalidate();
+                return;
+            }
+            angle *= 0.55f;
+            invalidate();
+            postDelayed(snapAnim, 16);
+        }
+    };
 
     public SteeringWheelView(Context context) {
         super(context);
@@ -49,6 +73,10 @@ public class SteeringWheelView extends View {
         paintTick.setStrokeWidth(3f);
         paintTick.setColor(0xFF90A4AE);
 
+        paintZone.setStyle(Paint.Style.STROKE);
+        paintZone.setStrokeWidth(16f);
+        paintZone.setColor(0xFF1B5E20);          /* 吸附区用深绿高亮 */
+
         paintKnob.setStyle(Paint.Style.FILL);
         paintKnob.setColor(0xFF00897B);
 
@@ -56,7 +84,6 @@ public class SteeringWheelView extends View {
         paintText.setColor(Color.WHITE);
     }
 
-    /** 当前角度（度） */
     public float getAngle() {
         return angle;
     }
@@ -75,6 +102,8 @@ public class SteeringWheelView extends View {
 
     /** 手动回正 */
     public void recenter() {
+        removeCallbacks(snapAnim);
+        animating = false;
         angle = 0f;
         inSnap = true;
         invalidate();
@@ -97,10 +126,9 @@ public class SteeringWheelView extends View {
         float r = Math.min(cx, cy) - 26f;
         if (r < 40f) r = 40f;
 
-        // 外圈
         c.drawCircle(cx, cy, r, paintRing);
 
-        // 刻度：每 15° 一小格，每 45° 长一点
+        // 刻度
         for (int deg = -135; deg <= 135; deg += 15) {
             double rad = Math.toRadians(deg);
             float len = (deg % 45 == 0) ? 18f : 9f;
@@ -111,18 +139,15 @@ public class SteeringWheelView extends View {
             c.drawLine(x1, y1, x2, y2, paintTick);
         }
 
-        // 吸附区阴影（±8°）
-        paintTick.setColor(0xFFB2DFDB);
-        paintTick.setStrokeWidth(14f);
+        // 吸附区（±12°）高亮：这是"磁吸"能看见的那一段
         arcRect.set(cx - r, cy - r, cx + r, cy + r);
-        c.drawArc(arcRect, 270f - SNAP_ZONE, SNAP_ZONE * 2f, false, paintTick);
-        paintTick.setColor(0xFF90A4AE);
-        paintTick.setStrokeWidth(3f);
+        c.drawArc(arcRect, 270f - SNAP_ZONE, SNAP_ZONE * 2f, false, paintZone);
+        c.drawArc(arcRect, 270f - SOFT_ZONE, SOFT_ZONE * 2f, false, paintTick);
 
         // 中心 0° 基线
         paintTick.setColor(0xFF4DB6AC);
-        paintTick.setStrokeWidth(5f);
-        c.drawLine(cx, cy - r, cx, cy - r + 26f, paintTick);
+        paintTick.setStrokeWidth(6f);
+        c.drawLine(cx, cy - r, cx, cy - r + 30f, paintTick);
         paintTick.setColor(0xFF90A4AE);
         paintTick.setStrokeWidth(3f);
 
@@ -133,7 +158,6 @@ public class SteeringWheelView extends View {
         c.drawCircle(cx, cy, r * 0.55f, paintRing);
         c.drawCircle(kx, ky, 26f, paintKnob);
 
-        // 中心读数
         paintText.setTextSize(r * 0.22f);
         String s = (angle >= 0 ? "+" : "") + Math.round(angle) + "°";
         c.drawText(s, cx, cy + r * 0.08f, paintText);
@@ -163,7 +187,10 @@ public class SteeringWheelView extends View {
                 float dy = e.getY() - cy;
                 float dist = (float) Math.sqrt(dx * dx + dy * dy);
                 float r = Math.min(cx, cy) - 26f;
-                if (dist > r + 60f) return false;         // 圈子外面不响应
+                if (dist > r + 60f) return false;
+
+                removeCallbacks(snapAnim);
+                animating = false;
                 dragging = true;
                 lastTouchAngle = touchAngle(e.getX(), e.getY());
                 return true;
@@ -173,18 +200,17 @@ public class SteeringWheelView extends View {
 
                 float a = touchAngle(e.getX(), e.getY());
                 float delta = a - lastTouchAngle;
-                // 归一化到 -180~180，避免跨 ±180 时跳一大截
                 while (delta > 180f) delta -= 360f;
                 while (delta < -180f) delta += 360f;
 
-                // 软吸附：靠近中间时减敏，模拟"卡位"
-                float sens = (Math.abs(angle) < SOFT_ZONE) ? 0.45f : 1f;
+                /* 软吸附：离 0° 越近越"粘"（灵敏度 0.18），外面是 1.0 */
+                float sens = (Math.abs(angle) < SOFT_ZONE) ? SOFT_SENS : 1f;
                 angle += delta * sens;
 
                 if (angle > MAX_ANGLE) angle = MAX_ANGLE;
                 if (angle < -MAX_ANGLE) angle = -MAX_ANGLE;
 
-                // 硬吸附：进 8° 直接归零，并从外面进来的那一下给个"咔哒"
+                /* 硬吸附：进 12° 直接归零，并从外面进来的那一下给个"咔哒" */
                 if (Math.abs(angle) < SNAP_ZONE) {
                     if (!inSnap) {
                         angle = 0f;
@@ -202,6 +228,14 @@ public class SteeringWheelView extends View {
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL: {
                 dragging = false;
+                /* 松手时如果在 ±22° 内，自动吸回 0°（强振动反馈） */
+                if (Math.abs(angle) > 0.1f && Math.abs(angle) < RELEASE_SNAP) {
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                    if (!animating) {
+                        animating = true;
+                        post(snapAnim);
+                    }
+                }
                 invalidate();
                 return true;
             }
