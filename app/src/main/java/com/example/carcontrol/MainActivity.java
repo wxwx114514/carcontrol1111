@@ -60,7 +60,10 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
     private Button btnEstop;
     private Button btnCfg;
 
-    private boolean estopLatched = false;
+    private boolean estopPulse = false;         /* 急停脉冲：点一次 → 刹停 → 自动解除 */
+    private long    estopUntil = 0L;
+    private static final long ESTOP_MS = 150L;  /* 急停持续时间（33Hz 下约 5 帧） */
+
     private boolean txRunning = false;
     private boolean pendingConnect = false;
 
@@ -75,9 +78,15 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
                 txRunning = false;
                 return;
             }
-            int v = estopLatched ? 0 : slider.getValue();
-            int w = estopLatched ? 0 : wheel.getW();
-            int flags = estopLatched
+            boolean estopNow = estopPulse;
+            if (estopNow && System.currentTimeMillis() >= estopUntil) {
+                estopPulse = false;                 /* 到时间自动解除 */
+                estopNow = false;
+            }
+
+            int v = estopNow ? 0 : slider.getValue();
+            int w = estopNow ? 0 : wheel.getW();
+            int flags = estopNow
                     ? (CarProtocol.FLAG_ESTOP | CarProtocol.FLAG_BRAKE)
                     : 0;
             bt.offerMotion(CarProtocol.frame(v, w, flags));
@@ -291,26 +300,23 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
                 .show();
     }
 
-    // ===================== 急停（自锁） =====================
+    // ===================== 急停（点一次刹停，自动解除） =====================
 
     private void onEstopClicked() {
-        if (estopLatched) {
-            toast("急停已锁定，需断开重连才能解除");
-            return;
-        }
-        estopLatched = true;
-        btnEstop.setEnabled(false);
-        btnEstop.setText("已锁定");
+        estopPulse = true;
+        estopUntil = System.currentTimeMillis() + ESTOP_MS;
+
+        /* 顺手把两个控制都清零，避免急停结束后车按旧速度继续冲 */
         slider.setValue(0);
         wheel.recenter();
+
         updateStatus();
-        toast("急停已锁定");
+        toast("急停！已自动解除");
     }
 
     private void clearEstop() {
-        estopLatched = false;
-        btnEstop.setEnabled(true);
-        btnEstop.setText("急停");
+        estopPulse = false;
+        estopUntil = 0L;
     }
 
     // ===================== 蓝牙 =====================
@@ -469,10 +475,10 @@ public class MainActivity extends Activity implements BtSppClient.Listener {
 
     private void updateStatus() {
         if (!bt.isConnected()) return;
-        String s = "已连接  V=" + (estopLatched ? 0 : slider.getValue())
-                + "  W=" + (estopLatched ? 0 : wheel.getW())
+        String s = "已连接  V=" + (estopPulse ? 0 : slider.getValue())
+                + "  W=" + (estopPulse ? 0 : wheel.getW())
                 + "  [死区 " + dutyMin + "% 微调 " + trim + "‰]"
-                + (estopLatched ? "  急停锁定" : "");
+                + (estopPulse ? "  急停中" : "");
         status.setText(s);
     }
 
